@@ -65,6 +65,55 @@ const fetchMessages = async () => {
   }
 };
 
+const processBotMessages = (respuesta, idOffset = 0) => {
+  const mensajesSeparados = respuesta.split('[SEP]');
+  
+  mensajesSeparados.forEach((texto, index) => {
+    let currentText = texto.trim();
+    if (currentText) {
+      let imageUrl = null;
+      
+      // 1. Extraer imágenes en formato Markdown: ![alt](url)
+      const markdownImageRegex = /!\[.*?\]\((https?:\/\/[^\s)]+)\)/;
+      const markdownMatch = currentText.match(markdownImageRegex);
+      
+      if (markdownMatch) {
+        imageUrl = markdownMatch[1];
+        // Remover el markdown completo del texto
+        currentText = currentText.replace(markdownMatch[0], '').trim();
+      } else {
+        // 2. Fallback para URLs planas
+        const urlRegex = /(https?:\/\/[^\s)]+)/g;
+        const urls = currentText.match(urlRegex);
+        
+        if (urls) {
+          // Detecta si la URL es de una imagen (DALL-E, Cloudinary, o tiene extensión de imagen)
+          const imageRegex = /\.(jpeg|jpg|gif|png|webp)|oaidalleapiprodscus\.blob\.core\.windows\.net|res\.cloudinary\.com/i;
+          for (let i = 0; i < urls.length; i++) {
+            if (imageRegex.test(urls[i])) {
+              imageUrl = urls[i];
+              // Quita la URL del texto para que no se vea duplicada
+              currentText = currentText.replace(urls[i], '').trim();
+              break; // Extrae la primera imagen
+            }
+          }
+        }
+      }
+
+      if (currentText || imageUrl) {
+        messages.value.push({
+          id: Date.now() + index + idOffset,
+          sender: 'Bot',
+          text: currentText,
+          image: imageUrl,
+          timestamp: new Date(),
+          incoming: true
+        });
+      }
+    }
+  });
+};
+
 const sendMessage = async () => {
   if (!newMessage.value.trim()) return;
 
@@ -91,28 +140,9 @@ const sendMessage = async () => {
       sessionId: currentSessionID.value 
     });
     
-    // El formato de respuesta de n8n puede variar según cómo esté configurado el nodo de respuesta.
-    // Intentamos extraer el texto de campos comunes.
-    const botData = response.data;
-    let botText = '';
-    
-    if (typeof botData === 'string') {
-      botText = botData;
-    } else if (Array.isArray(botData) && botData.length > 0) {
-      botText = botData[0].output || botData[0].response || botData[0].text || JSON.stringify(botData[0]);
-    } else {
-      botText = botData.output || botData.response || botData.text || JSON.stringify(botData);
-    }
-
-    const botMsg = {
-      id: Date.now() + 1,
-      sender: 'Bot',
-      text: botText,
-      timestamp: new Date(),
-      incoming: true
-    };
-    
-    messages.value.push(botMsg);
+    const datosRecibidos = response.data;
+    const respuesta = datosRecibidos.respuesta_bot || datosRecibidos.reply || datosRecibidos.output || (typeof datosRecibidos === 'string' ? datosRecibidos : '');
+    processBotMessages(respuesta, 0);
     scrollToBottom();
   } catch (error) {
     console.error('Error sending message to n8n:', error);
@@ -143,34 +173,77 @@ const onFileSelected = async (event) => {
   const file = event.target.files[0];
   if (!file) return;
 
-  if (!file.type.startsWith('image/')) {
-    alert('Por favor selecciona una imagen.');
+  const validTypes = ['image/jpeg', 'image/png', 'image/webp'];
+  if (!validTypes.includes(file.type)) {
+    alert('Por favor selecciona una imagen en formato .jpg, .png o .webp');
+    if (fileInput.value) {
+      fileInput.value.value = '';
+    }
     return;
   }
 
-  const reader = new FileReader();
-  reader.onload = async (e) => {
-    const imageData = e.target.result;
-    
-    // Add optimistic image message
-    const tempId = Date.now();
-    const localMsg = {
-      id: tempId,
-      sender: 'Me',
-      text: '',
-      image: imageData,
-      timestamp: new Date(),
-      incoming: false
-    };
-    
-    messages.value.push(localMsg);
+  // Mensaje optimista
+  const tempId = Date.now();
+  const localMsg = {
+    id: tempId,
+    sender: 'Me',
+    text: 'Subiendo imagen...',
+    image: null,
+    timestamp: new Date(),
+    incoming: false
+  };
+  messages.value.push(localMsg);
+  scrollToBottom();
+  isTyping.value = true;
+
+  try {
+    const formData = new FormData();
+    formData.append('file', file);
+    // IMPORTANTE: Debes crear un "Upload Preset" de tipo "Unsigned" en Cloudinary
+    formData.append('upload_preset', 'novacasa_unsigned'); 
+    formData.append('cloud_name', 'djlphhqgb');
+
+    // Subir a Cloudinary
+    const cloudinaryRes = await axios.post(
+      'https://api.cloudinary.com/v1_1/djlphhqgb/image/upload',
+      formData
+    );
+
+    const imageUrl = cloudinaryRes.data.secure_url;
+
+    // Actualizar mensaje local con la imagen
+    const msgIndex = messages.value.findIndex(m => m.id === tempId);
+    if (msgIndex !== -1) {
+      messages.value[msgIndex].text = '';
+      messages.value[msgIndex].image = imageUrl;
+    }
     scrollToBottom();
 
-    // Here you would normally upload the file to the server.
-    // Since I don't know the server's image endpoint, I'll just keep it locally for now
-    // or try to send it if there's a generic endpoint.
-  };
-  reader.readAsDataURL(file);
+    // Enviar la URL de la imagen al agente n8n
+    const n8nRes = await axios.post(N8N_WEBHOOK_URL, {
+      message: `[El usuario ha enviado una imagen: ${imageUrl}]`,
+      imageUrl: imageUrl,
+      sessionId: currentSessionID.value
+    });
+
+    const datosRecibidos = n8nRes.data;
+    const respuesta = datosRecibidos.respuesta_bot || datosRecibidos.reply || datosRecibidos.output || (typeof datosRecibidos === 'string' ? datosRecibidos : '');
+    processBotMessages(respuesta, 100);
+
+  } catch (error) {
+    console.error('Error al subir la imagen o contactar a n8n:', error);
+    const msgIndex = messages.value.findIndex(m => m.id === tempId);
+    if (msgIndex !== -1) {
+      messages.value[msgIndex].text = 'Error al subir la imagen.';
+    }
+  } finally {
+    isTyping.value = false;
+    scrollToBottom();
+    // Limpiar el input para permitir subir la misma imagen de nuevo
+    if (fileInput.value) {
+      fileInput.value.value = '';
+    }
+  }
 };
 
 const scrollToBottom = async () => {
@@ -183,9 +256,14 @@ const scrollToBottom = async () => {
 const resetChat = async () => {
   if (confirm('¿Estás seguro de que quieres reiniciar el chat y generar un nuevo SessionID?')) {
     try {
-      await axios.post(`${API_URL}/reset`);
+      try {
+        await axios.post(`${API_URL}/reset`);
+      } catch (e) {
+        // Ignore if the reset endpoint doesn't exist
+      }
       localStorage.removeItem('whatsapp_session_id');
-      window.location.reload();
+      currentSessionID.value = getOrGenerateSessionID();
+      messages.value = [];
     } catch (error) {
       console.error('Error al reiniciar el chat:', error);
     }
@@ -291,7 +369,7 @@ onMounted(() => {
       </div>
 
       <footer class="chat-footer">
-        <input type="file" ref="fileInput" hidden accept="image/*" @change="onFileSelected" />
+        <input type="file" ref="fileInput" hidden accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" @change="onFileSelected" />
         <Smile class="icon" />
         <Paperclip class="icon" @click="triggerFileUpload" />
         <input 
